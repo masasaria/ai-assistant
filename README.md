@@ -113,7 +113,7 @@ The app captures the host's system audio output, which includes whatever the VM 
 | medium | balanced | better |
 | large-v3-turbo | slower | best |
 
-The model is loaded on first transcription (lazy loading). Switch models in the dropdown — each loads on first use and is cached for the rest of the session.
+The model is loaded on start on small by default and cached for later. Switch models in the file.
 
 ---
 
