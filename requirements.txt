@@ -1,0 +1,9 @@
+flask
+ollama
+faster-whisper
+python-docx
+pdfplumber
+anthropic
+numpy
+SpeechRecognition
+pymupdf
