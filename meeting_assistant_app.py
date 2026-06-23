@@ -63,11 +63,16 @@ except ImportError:
 try:
     from faster_whisper import WhisperModel as _WhisperModel
     _WHISPER_AVAILABLE = True
-    _whisper = None   # lazy — loaded on first transcription request
-    print("  [Whisper] faster-whisper available — model loads on first use")
+    print("  [Whisper] faster-whisper available — loading 'small' model at startup…")
+    # Load default model at startup in a background thread so Flask starts immediately
+    def _preload_whisper():
+        try:
+            _get_whisper("small")
+            print("  [Whisper] 'small' model ready")
+        except Exception as e:
+            print(f"  [Whisper] Preload failed: {e}")
 except ImportError:
     _WHISPER_AVAILABLE = False
-    _whisper = None
     print("  [Whisper] Not installed — falling back to Google Speech")
     print("            To install: pip install faster-whisper")
 
@@ -186,6 +191,24 @@ def _chat_ollama(messages: list, max_tokens: int = 1000, num_ctx: int = 8192, sy
     return text
 
 
+def _chat_ollama_kb(messages: list, max_tokens: int = 1000, num_ctx: int = 8192, system: str = "") -> str:
+    """Call Ollama for KB building — uses ollama_model, bypasses provider setting."""
+    model = _store.get("ollama_model", "gemma4:12b")
+    use_think = "gemma4" in model
+    ollama_msgs = _to_ollama_messages(messages)
+    if system:
+        ollama_msgs = [{"role": "system", "content": system}] + ollama_msgs
+    resp = _ollama.chat(
+        model=model,
+        messages=ollama_msgs,
+        **({"think": False} if use_think else {}),
+        options={"num_predict": max_tokens, "num_ctx": num_ctx, "temperature": 0},
+    )
+    text = (resp.message.content or "").strip()
+    print(f"  [Chat/OllamaKB] {len(text)} chars (model={model})")
+    return text
+
+
 def _stream_ollama(messages: list, max_tokens: int = 400, num_ctx: int = 8192, system: str = ""):
     model = _store["model"]
     use_think = "gemma4" in model
@@ -194,7 +217,25 @@ def _stream_ollama(messages: list, max_tokens: int = 400, num_ctx: int = 8192, s
         ollama_msgs = [{"role": "system", "content": system}] + ollama_msgs
     stream = _ollama.chat(model=model, messages=ollama_msgs, stream=True,
         **({"think": False} if use_think else {}),
-        options={"num_predict": max_tokens, "num_ctx": num_ctx, "temperature": 0})
+        options={"num_predict": max_tokens, "num_ctx": num_ctx, "temperature": 0,
+                 "keep_alive": -1})
+    for chunk in stream:
+        token = (chunk.message.content or "")
+        if token:
+            yield token
+
+
+def _stream_ollama_kb(messages: list, max_tokens: int = 400, num_ctx: int = 8192, system: str = ""):
+    """Stream from Ollama KB model — bypasses provider setting."""
+    model = _store.get("ollama_model", "gemma4:12b")
+    use_think = "gemma4" in model
+    ollama_msgs = _to_ollama_messages(messages)
+    if system:
+        ollama_msgs = [{"role": "system", "content": system}] + ollama_msgs
+    stream = _ollama.chat(model=model, messages=ollama_msgs, stream=True,
+        **({"think": False} if use_think else {}),
+        options={"num_predict": max_tokens, "num_ctx": num_ctx, "temperature": 0,
+                 "keep_alive": -1})
     for chunk in stream:
         token = (chunk.message.content or "")
         if token:
@@ -207,7 +248,7 @@ def _stream_anthropic(messages: list, max_tokens: int = 400, system: str = ""):
     api_key = _store.get("api_key", "").strip()
     if not api_key:
         raise RuntimeError("No Anthropic API key")
-    model = _store["model"]
+    model = _store.get("anthropic_model") or _store["model"]
     client = _anthropic.Anthropic(api_key=api_key)
     kwargs = dict(model=model, max_tokens=max_tokens, temperature=0,
                   messages=_to_anthropic_messages(messages))
@@ -218,9 +259,64 @@ def _stream_anthropic(messages: list, max_tokens: int = 400, system: str = ""):
             yield token
 
 
+def _stream_race(messages: list, max_tokens: int = 400, num_ctx: int = 8192, system: str = ""):
+    """Fire both Ollama and Anthropic simultaneously; stream tokens from whichever responds first."""
+    import queue as _queue
+    q = _queue.Queue()
+    _SENTINEL = object()
+
+    def _anthropic_worker():
+        try:
+            for tok in _stream_anthropic(messages, max_tokens, system=system):
+                q.put(("a", tok))
+        except Exception as e:
+            print(f"  [Race/Anthropic] Error: {e}")
+            q.put(("a_err", str(e)))
+        finally:
+            q.put(("a", _SENTINEL))
+
+    def _ollama_worker():
+        try:
+            for tok in _stream_ollama_kb(messages, max_tokens, num_ctx, system=system):
+                q.put(("o", tok))
+        except Exception as e:
+            print(f"  [Race/Ollama] Error: {e}")
+            q.put(("o_err", str(e)))
+        finally:
+            q.put(("o", _SENTINEL))
+
+    ta = threading.Thread(target=_anthropic_worker, daemon=True)
+    to = threading.Thread(target=_ollama_worker, daemon=True)
+    ta.start()
+    to.start()
+
+    winner = None
+    done_count = 0
+
+    while done_count < 2:
+        src, tok = q.get()
+        if src in ("a_err", "o_err"):
+            done_count += 1
+            # If the winner errored, we'd get no more tokens from it anyway
+            continue
+        if tok is _SENTINEL:
+            done_count += 1
+            continue
+        if winner is None:
+            winner = src
+            label = "Claude" if src == "a" else "Ollama"
+            print(f"  [Race] {label} responded first — streaming from {label}")
+        if src == winner:
+            yield tok
+        # discard tokens from the slower model
+
+
 def _stream(messages: list, max_tokens: int = 400, num_ctx: int = 8192, system: str = ""):
-    if _store.get("provider") == "anthropic":
+    provider = _store.get("provider")
+    if provider == "anthropic":
         yield from _stream_anthropic(messages, max_tokens, system=system)
+    elif provider == "hybrid":
+        yield from _stream_race(messages, max_tokens, num_ctx, system=system)
     else:
         yield from _stream_ollama(messages, max_tokens, num_ctx, system=system)
 
@@ -231,7 +327,7 @@ def _chat_anthropic(messages: list, max_tokens: int = 1000, system: str = "") ->
     api_key = _store.get("api_key", "").strip()
     if not api_key:
         raise RuntimeError("No Anthropic API key — enter it in the Model step")
-    model = _store["model"]
+    model = _store.get("anthropic_model") or _store["model"]
     client = _anthropic.Anthropic(api_key=api_key)
     kwargs = dict(model=model, max_tokens=max_tokens,
                   temperature=0,   # deterministic — same context → same answer
@@ -245,7 +341,8 @@ def _chat_anthropic(messages: list, max_tokens: int = 1000, system: str = "") ->
 
 
 def _chat(messages: list, max_tokens: int = 1000, num_ctx: int = 8192, system: str = "") -> str:
-    if _store.get("provider") == "anthropic":
+    provider = _store.get("provider")
+    if provider in ("anthropic", "hybrid"):
         return _chat_anthropic(messages, max_tokens, system=system)
     return _chat_ollama(messages, max_tokens, num_ctx, system=system)
 
@@ -526,12 +623,40 @@ def _extract_topic(question: str) -> str:
         print(f"  [Topic] '{question}' → '{result}'")
     return result
 
+# Hardcoded semantic clusters for academic/cybersecurity terms that
+# the auto-generated concept map frequently misses.
+_QUERY_CLUSTERS = {
+    # methodology cluster — catches PDCA chapter content
+    "metodolog": ["pdca", "planificar", "hacer", "verificar", "actuar",
+                  "ciclo", "mejora", "continua", "deming", "plan", "check",
+                  "do", "act", "fase", "etapa", "proceso", "enfoque",
+                  "investigacion", "experimental", "validacion", "diseño"],
+    "pdca":      ["metodolog", "planificar", "hacer", "verificar", "actuar",
+                  "ciclo", "mejora", "continua", "deming"],
+    # results / comparison cluster
+    "resultado": ["hallazgo", "obtuv", "logr", "alcanz", "medicion",
+                  "rendimiento", "latencia", "disponibilidad", "throughput"],
+    "comparar":  ["estudio", "autor", "literatura", "previo", "similar",
+                  "diferencia", "coincid", "contraste", "versus"],
+    # architecture cluster
+    "arquitect": ["sdwan", "starlink", "vpn", "firewall", "nodo", "enlace",
+                  "topolog", "red", "infraestructur", "diseno"],
+    "sdwan":     ["arquitect", "wan", "enlace", "nodo", "topolog", "red"],
+    # risk / security cluster
+    "riesgo":    ["amenaza", "vulnerabilid", "control", "mitigacion",
+                  "iso", "nist", "ciberseguridad", "gestion"],
+    "implementa": ["despleg", "configurar", "instalar", "integrar",
+                   "desarroll", "construir", "ejecutar", "propuesta"],
+}
+
+
 def _expand_query(question: str) -> list:
     cm       = _store.get("concept_map", {})
     keywords = _normalize_spanish(set(re.findall(r"\w{3,}", question.lower())))
     expanded = set(keywords)
+
+    # 1. Concept-map expansion (auto-generated per document)
     for alt, canonical in cm.get("aliases", {}).items():
-        # canonical may be a list
         if isinstance(canonical, list):
             canonical = " ".join(str(x) for x in canonical)
         if set(re.findall(r"\w{3,}", alt.lower())) & keywords:
@@ -542,6 +667,12 @@ def _expand_query(question: str) -> list:
         sec_words = set(re.findall(r"\w{3,}", section.lower()))
         if sec_words & keywords:
             expanded.update(sec_words)
+
+    # 2. Hardcoded cluster expansion — catches terms the concept map misses
+    for trigger, extras in _QUERY_CLUSTERS.items():
+        if any(kw.startswith(trigger) or trigger.startswith(kw) for kw in keywords):
+            expanded.update(extras)
+
     if expanded != keywords:
         print(f"  [Expand] added: {sorted(expanded - keywords)}")
     return list(expanded)
@@ -582,24 +713,27 @@ def _retrieve(keywords: list, top_n: int = 60) -> tuple:
                 end += 1
             expanded.update(range(start, end))
 
-    indices   = sorted(expanded)
-    indices_with_tables = sorted(set(indices) | set(all_table_indices))
-    raw_parts = [paragraphs[i] for i in indices_with_tables if i < raw_count]
-    kb_parts  = [paragraphs[i] for i in indices_with_tables if i >= raw_count]
+    indices  = sorted(expanded)
+    # Only merge all_table_indices when the query actually matched table content;
+    # merging unconditionally caused has_tables_in_context to always be True,
+    # which suppressed the KB for every question regardless of relevance.
+    matched_table_indices = [i for i in all_table_indices if i in set(indices)]
+    indices_with_tables   = sorted(set(indices) | set(matched_table_indices))
 
-    # ── KEY CHANGE ───────────────────────────────────────────────────────────
-    # If we found actual table rows in the raw source, suppress KB entirely.
-    # KB is a Gemma-processed summary and will paraphrase table content.
-    # Raw source is always authoritative for structured data.
-    # Suppress KB whenever any table is present in context.
-    # Raw table rows are always authoritative; KB narrative about tables causes drift.
-    has_tables_in_context = any(paragraphs[i].startswith("[TABLE") for i in indices_with_tables if i < raw_count)
+    # Separate table rows from regular paragraphs so tables go first in the
+    # context window — they were getting truncated when large docs pushed them
+    # past the 10000-char cutoff.
+    table_parts  = [paragraphs[i] for i in indices_with_tables if i < raw_count and paragraphs[i].startswith("[TABLE")]
+    other_parts  = [paragraphs[i] for i in indices_with_tables if i < raw_count and not paragraphs[i].startswith("[TABLE")]
+    kb_parts     = [paragraphs[i] for i in sorted(set(indices)) if i >= raw_count]
+
+    has_tables_in_context = bool(table_parts)
+
     # Find the [BIBLIOGRAPHY] section injected by _parse_docx (Word citation XML)
     bib_idx = next(
         (i for i, p in enumerate(paragraphs[:raw_count]) if p.startswith("[BIBLIOGRAPHY]")),
         None,
     )
-    # Fallback: old-style [1] Author... numbered bibliography
     if bib_idx is None:
         bib_idx = next(
             (i for i, p in enumerate(paragraphs[:raw_count]) if re.search(r"^\[\d+\]", p.strip())),
@@ -609,55 +743,101 @@ def _retrieve(keywords: list, top_n: int = 60) -> tuple:
         "\n\n---REFERENCES---\n" + paragraphs[bib_idx][:5000]
     ) if bib_idx is not None else ""
 
-    if table_found or has_tables_in_context:
-        return "\n".join(raw_parts)[:10000] + ref_block, ""
+    # Tables first so they're never cut off, then remaining paragraphs up to budget.
+    # 5000-char cap (≈1250 tokens) keeps prompt encoding fast on a local 12B model.
+    RAW_BUDGET = 5000
+    table_text = "\n\n".join(table_parts)
+    other_text = "\n".join(other_parts)
+    remaining  = max(0, RAW_BUDGET - len(table_text) - 2)
+    raw_text   = (table_text + "\n\n" + other_text[:remaining]).strip() if table_text else other_text[:RAW_BUDGET]
 
-    return "\n".join(raw_parts)[:10000] + ref_block, "\n".join(kb_parts)[:3000]
+    if table_found or has_tables_in_context:
+        return raw_text + ref_block[:2000], ""
+
+    return raw_text + ref_block[:2000], "\n".join(kb_parts)[:2000]
 
 # ── Background processing ──────────────────────────────────────────────────────
 
+_KB_PROMPT_TEMPLATE = (
+    "Build a complete reference knowledge base from this document{part_note}.\n\n"
+    "MANDATORY REQUIREMENTS:\n"
+    "1. List every section/chapter title with its exact name.\n"
+    "2. For each section: include ALL content — every fact, number, "
+    "name, list item, and table row. Omit nothing.\n"
+    "3. TABLES — ABSOLUTE RULE: reproduce the table as a numbered list.\n"
+    "   Each row becomes one numbered item using the EXACT cell text.\n"
+    "   FORBIDDEN: rewording, expanding, merging, or explaining any row.\n"
+    "   Example — if table has: 'Dependencia de enlace único'\n"
+    "   You write: '1. Dependencia de enlace único'\n"
+    "   NOT: '1. Riesgo de depender de un solo enlace de comunicación'\n"
+    "   Count rows before writing. If 10 rows → exactly 10 numbered items.\n"
+    "4. Images/charts: describe their content in full detail.\n"
+    "5. Preserve all proper nouns, numbers, and technical terms exactly as written.\n"
+    "6. If there is a Q&A section or defense preparation questions with answers, "
+    "   reproduce them VERBATIM — do not summarize or paraphrase.\n\n"
+    "DOCUMENT:\n{chunk}"
+)
+
+
 def _process_in_background(text: str, images: list):
     """
-    Sends the full document to Gemma 4 to build:
-      1. A verbatim knowledge base (all sections, all table rows, image descriptions)
+    Builds a knowledge base from the document using the selected model.
+    In Hybrid or Anthropic+Ollama modes, also runs Ollama KB in parallel for richer retrieval.
+      1. A verbatim knowledge base (all sections, all table rows, Q&A, image descriptions)
       2. A concept map (section names + spoken-language aliases)
-
-    This runs once after upload. Start Listening is blocked until it completes.
-    Having it done upfront means /ask never competes with a processing job.
     """
     _store["processing"]  = True
     _store["proc_error"]  = ""
     _store["summary"]     = ""
     _store["concept_map"] = {}
 
+    provider = _store.get("provider", "ollama")
     # Gemma 4 12B: 256K token window. Send up to ~140K chars per chunk (~35K tokens).
     MAX_CHARS = 140_000
     chunks    = [text[i:i + MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
     summaries = []
 
+    # ── Parallel Ollama KB: run when using Anthropic or Hybrid so Gemma also
+    #    indexes the document (Gemma is better at literal Q&A extraction).
+    ollama_extra_summaries: list = []
+    ollama_kb_thread = None
+    def _ollama_is_running():
+        try:
+            _ollama.list()
+            return True
+        except Exception:
+            return False
+
+    run_parallel_ollama = (
+        _store.get("ollama_model")
+        and provider in ("anthropic", "hybrid")
+        and _ollama_is_running()
+    )
+    if run_parallel_ollama:
+        def _ollama_kb_worker():
+            for cidx, chunk in enumerate(chunks):
+                part_note = f" (part {cidx+1} of {len(chunks)})" if len(chunks) > 1 else ""
+                content = [{"type": "text", "text": _KB_PROMPT_TEMPLATE.format(
+                    part_note=part_note, chunk=chunk)}]
+                try:
+                    result = _chat_ollama_kb(
+                        [{"role": "user", "content": content}],
+                        max_tokens=10000,
+                        num_ctx=40000,
+                    )
+                    ollama_extra_summaries.append(result)
+                    print(f"  [Hybrid/OllamaKB] Chunk {cidx+1} done: {len(result):,} chars")
+                except Exception as e:
+                    print(f"  [Hybrid/OllamaKB] Chunk {cidx+1} error: {e}")
+        ollama_kb_thread = threading.Thread(target=_ollama_kb_worker, daemon=True)
+        ollama_kb_thread.start()
+        print(f"  [Hybrid] Ollama KB building started in parallel (model={_store.get('ollama_model')})")
+
     try:
         for cidx, chunk in enumerate(chunks):
             part_note = f" (part {cidx+1} of {len(chunks)})" if len(chunks) > 1 else ""
-            content = [{
-                "type": "text",
-                "text": (
-                    f"Build a complete reference knowledge base from this document{part_note}.\n\n"
-                    "MANDATORY REQUIREMENTS:\n"
-                    "1. List every section/chapter title with its exact name.\n"
-                    "2. For each section: include ALL content — every fact, number, "
-                    "name, list item, and table row. Omit nothing.\n"
-                   "3. TABLES — ABSOLUTE RULE: reproduce the table as a numbered list.\n"
-                   "   Each row becomes one numbered item using the EXACT cell text.\n"
-                   "   FORBIDDEN: rewording, expanding, merging, or explaining any row.\n"
-                   "   Example — if table has: 'Dependencia de enlace único'\n"
-                   "   You write: '1. Dependencia de enlace único'\n"
-                   "   NOT: '1. Riesgo de depender de un solo enlace de comunicación'\n"
-                   "   Count rows before writing. If 10 rows → exactly 10 numbered items.\n"
-                    "4. Images/charts: describe their content in full detail.\n"
-                    "5. Preserve all proper nouns, numbers, and technical terms exactly as written.\n\n"
-                    f"DOCUMENT:\n{chunk}"
-                ),
-            }]
+            content = [{"type": "text", "text": _KB_PROMPT_TEMPLATE.format(
+                part_note=part_note, chunk=chunk)}]
             # Attach images to first chunk (Ollama vision: image_url format)
             if cidx == 0 and images:
                 for img in images[:15]:
@@ -672,10 +852,27 @@ def _process_in_background(text: str, images: list):
 
             print(f"  [Processing] Chunk {cidx+1}/{len(chunks)}: {len(chunk):,} chars → generating KB…")
             # Anthropic models cap at 8192 output tokens; Ollama supports 10000+
-            proc_max_tokens = 8000 if _store.get("provider") == "anthropic" else 10000
+            # Both anthropic and hybrid run the Anthropic KB pass here.
+            # Ollama KB runs in parallel (started above) and gets merged after.
+            proc_max_tokens = 8000 if provider in ("anthropic", "hybrid") else 10000
             result = _chat([{"role": "user", "content": content}], max_tokens=proc_max_tokens, num_ctx=40000)
             summaries.append(result)
             print(f"  [Processing] Chunk {cidx+1} done: {len(result):,} chars")
+
+        # Wait for parallel Ollama KB
+        if ollama_kb_thread is not None:
+            print("  [Hybrid] Waiting for Ollama KB to finish…")
+            ollama_kb_thread.join(timeout=600)
+            if ollama_extra_summaries:
+                combined = "\n\n---\n\n".join(ollama_extra_summaries)
+                extra_paras = [p.strip() for p in combined.split("\n") if len(p.strip()) > 20]
+                print(f"  [Hybrid] Ollama KB ready: {len(extra_paras)} paragraphs")
+                summaries = summaries + ollama_extra_summaries  # merge both KBs
+            else:
+                print("  [Hybrid] Ollama KB produced no output — using primary KB only")
+
+        if not summaries:
+            raise RuntimeError("No KB content generated — check model availability")
 
         _store["summary"] = "\n\n---\n\n".join(summaries)
         print(f"  [Processing] Knowledge base: {len(_store['summary']):,} chars total")
@@ -781,6 +978,7 @@ def _transcribe_whisper(audio_bytes: bytes, lang: str, model_name: str = "medium
     vocab     = _vocab_hint()
     arr       = _wav_to_float32(audio_bytes)
     model     = _get_whisper(model_name)
+    print(f"  [Whisper] audio: {len(arr)} samples, duration={len(arr)/16000:.1f}s, rms={float(np.sqrt(np.mean(arr**2))):.5f}, max={float(np.max(np.abs(arr))):.4f}")
 
     segments, info = model.transcribe(
         arr,
@@ -789,8 +987,7 @@ def _transcribe_whisper(audio_bytes: bytes, lang: str, model_name: str = "medium
         initial_prompt=vocab if vocab else None,
         beam_size=1,
         condition_on_previous_text=False,   # skip recurrent context — faster
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 300},
+        vad_filter=False,
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
     print(f"  [Whisper] {info.language} ({info.language_probability:.0%}): {text!r}")
@@ -821,15 +1018,22 @@ def load_document():
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
-    f        = request.files["file"]
-    filename = f.filename or ""
-    ext      = Path(filename).suffix.lower()
-    model    = request.form.get("model", DEFAULT_MODEL).strip()
-    provider = request.form.get("provider", "ollama").strip()
-    api_key  = request.form.get("api_key", "").strip()
-    if model:    _store["model"]    = model
-    if provider: _store["provider"] = provider
-    if api_key:  _store["api_key"]  = api_key
+    f            = request.files["file"]
+    filename     = f.filename or ""
+    ext          = Path(filename).suffix.lower()
+    model        = request.form.get("model", DEFAULT_MODEL).strip()
+    provider     = request.form.get("provider", "ollama").strip()
+    api_key      = request.form.get("api_key", "").strip()
+    ollama_model = request.form.get("ollama_model", "").strip()
+    anthropic_model = request.form.get("anthropic_model", "").strip()
+    if model:           _store["model"]           = model
+    if provider:        _store["provider"]        = provider
+    if api_key:         _store["api_key"]         = api_key
+    if ollama_model:    _store["ollama_model"]    = ollama_model
+    if anthropic_model: _store["anthropic_model"] = anthropic_model
+    # For hybrid: model field is the Anthropic answer model
+    if provider == "hybrid" and anthropic_model:
+        _store["model"] = anthropic_model
 
     try:
         if ext == ".docx":
@@ -946,9 +1150,15 @@ def ask():
     if _store["processing"]:
         return jsonify({"error": "Document still processing, please wait"}), 503
 
-    topic             = _extract_topic(question)
-    keywords          = _expand_query(topic)
-    raw_text, kb_text = _retrieve(keywords)
+    topic    = _extract_topic(question)
+    keywords = _expand_query(topic)
+    # Wider retrieval for deep questions (methodology, studies, comparisons)
+    _deep_triggers = (
+        "metodolog", "pdca", "estudio", "literatura", "comparar", "resultado",
+        "hallazgo", "revision", "investigaci", "bibliograf", "marco", "teoric"
+    )
+    _retrieval_top_n = 100 if any(t in question.lower() for t in _deep_triggers) else 60
+    raw_text, kb_text = _retrieve(keywords, top_n=_retrieval_top_n)
 
     context = "---SOURCE DOCUMENT (authoritative)---\n" + raw_text
     if kb_text:
@@ -958,76 +1168,74 @@ def ask():
     section_list = " | ".join(cm.get("sections", [])[:20])
 
     system_prompt = (
-        "You are one of three co-authors defending your master's thesis in cybersecurity to a jury. "
-        "You speak directly as a researcher who built and tested this system. "
-        "You are a human expert, NOT an AI assistant — never say 'I am an AI', never say 'I don't have access', "
-        "never say 'as an AI language model'. Speak as yourself, a person who did this work.\n\n"
-        "PERSONA RULES:\n"
-        "- Always use WE / NOSOTROS — never 'I' or 'yo'. This is a team of three researchers.\n"
-        "  'Nosotros implementamos', 'en nuestro estudio', 'nuestra propuesta', 'decidimos', 'encontramos'.\n"
-        "- Speak in the first person plural as if recounting your own research experience.\n"
-        "- Start immediately with the answer — no preamble, no 'I think', no 'according to the document'.\n"
-        "- Tone: confident and technical, as someone who spent months on this project.\n\n"
-        "FORMAT RULES:\n"
-        "- Length: simple factual → 1-3 sentences. Study enumeration → one sentence per study. "
-        "  Complex → 2-3 short paragraphs max.\n"
-        "- Natural flowing prose as spoken aloud. NEVER use bullet points, numbered lists, dashes, or markdown.\n"
-        "- FORBIDDEN filler: 'El documento menciona', 'Según el texto', 'De acuerdo con', "
-        "'the document states', 'according to', 'in conclusion', 'I hope this helps', "
-        "'como sistema de IA', 'como modelo de lenguaje'.\n"
-        "- Use exact technical terms: SD-WAN, Starlink, SIEM, hub-and-spoke, "
-        "  ISO 27001, VPN, AES-256, SpeedFusion, Peplink, etc.\n"
-        "- Silently fix speech-to-text errors using document vocabulary.\n\n"
-        "CONTENT RULES:\n"
-        "- TECHNICAL PRECISION: 'qué tipo', 'qué protocolo', 'cuál algoritmo', 'cuánto' "
-        "  require a SPECIFIC named value — not a description. "
-        "  Search context for exact values: AES-256, IPSec, IKEv2, SHA, TLS, port numbers. "
-        "  FORBIDDEN: describing what something does instead of naming what it IS.\n"
-        "- CITATIONS: Author names appear inline in context as [Author (Year)]. "
-        "  Use them exactly as written. NEVER say 'et al.' — use 'y colaboradores'. "
-        "  NEVER output a raw tag like 'And20', 'Asi', 'GRA22' — these are internal IDs, not author names. "
-        "  Always resolve tags using the ---CITATION RESOLVER--- table provided in the context. "
-        "  Example: seeing '[And20]' or 'And20' → look up in CITATION RESOLVER → 'Andromeda y Gunawan (2020)'.\n"
-        "- STUDY ENUMERATION: When asked about studies or theoretical framework, name EVERY study "
-        "  individually with its author and year. "
-        "  FORBIDDEN: 'diversos autores', 'otros autores', 'investigadores', 'varios estudios', "
-        "  'algunos trabajos', 'autores no identificados'. "
-        "  Each study gets one sentence: author + year + specific finding. "
-        "  Format: 'García y colaboradores (2021) demostraron que X. López (2020) validó Y.'\n"
-        "- BIBLIOGRAPHY: A [BIBLIOGRAPHY] section is available with all references numbered. "
-        "  Use it to find any author you cannot find inline.\n"
-        "- TABLES: Read actual row values from [TABLE N] and speak them naturally in prose.\n"
-        "- WRONG PREMISES: If the question has a wrong assumption, answer with the correct information "
-        "  and briefly note the correction. NEVER refuse or say the info is absent because of a wrong premise.\n"
-        "- If information is genuinely absent, say so in one direct sentence using 'nosotros'."
+        "You are one of three co-authors defending your master's thesis in cybersecurity. "
+        "Speak as a human researcher — NEVER as an AI. Use WE/NOSOTROS always "
+        "('nosotros implementamos', 'nuestra propuesta', 'encontramos'). "
+        "Start immediately with the answer — no preamble.\n\n"
+        "FORMAT: Flowing prose only. No bullets, lists, dashes, or markdown. "
+        "Simple fact → 1-3 sentences. Complex → 2-3 short paragraphs max. "
+        "Exact technical terms: SD-WAN, Starlink, AES-256, IPSec, IKEv2, ISO 27001, SpeedFusion, Peplink. "
+        "Silently fix speech-to-text errors. "
+        "FORBIDDEN filler: 'El documento menciona', 'Según el texto', 'according to', 'I hope this helps'.\n\n"
+        "TECHNICAL PRECISION: 'qué tipo/protocolo/algoritmo/cuánto' → give the SPECIFIC named value, never describe what it does.\n\n"
+        "CITATIONS: ONLY cite entries from ---CITATION RESOLVER---. "
+        "Never invent authors/years. Never write raw tag codes (And20, GRA22, etc.) — resolve them via the table. "
+        "Say 'y colaboradores' not 'et al.'. If unsure, omit the citation entirely — hallucinated citations are worse than none.\n\n"
+        "STUDIES: When asked about literature/comparisons, name EVERY relevant study: "
+        "'García y colaboradores (2021) demostraron X; López (2020) encontró Y.' Never vague summaries.\n\n"
+        "TABLES: Read [TABLE N] row values and speak them as prose. "
+        "WRONG PREMISES: Correct them and answer with the right info. "
+        "Missing info: one direct sentence with 'nosotros'.\n\n"
+        "CLARIFICATION EXCHANGES: The question may contain a short back-and-forth conversation "
+        "(jury question → your clarifying question → jury's refined answer). "
+        "In that case, identify the FINAL refined scope and answer only that. "
+        "Example: 'riesgos del proyecto / los de planificacion / la de planificacion' → answer risks from the planning phase only."
     )
 
-    # Build CITATION RESOLVER block from stored tag_map
+    # Build CITATION RESOLVER and append to system prompt so the model treats it as a hard constraint
     tag_map_store = _store.get("tag_map", {})
     if tag_map_store:
         resolver_lines = "\n".join(f"  {tag} → {cstr}" for tag, cstr in sorted(tag_map_store.items()))
-        citation_resolver = f"\n\n---CITATION RESOLVER---\n{resolver_lines}"
-    else:
-        citation_resolver = ""
+        system_prompt += (
+            f"\n\n---CITATION RESOLVER (authoritative — only these citations exist)---\n"
+            f"{resolver_lines}\n"
+            f"RULE: Only cite entries from this table. Any author or year NOT in this table is HALLUCINATED — omit it."
+        )
 
     user_msg = (
         f"Available sections: {section_list}\n\n"
-        f"{context}{citation_resolver}\n\n"
+        f"{context}\n\n"
         f"Question: {question}\n"
         f"Respond in {language}."
     )
 
-    print(f"  [Ask] ctx={len(raw_text)+len(kb_text)} chars, q={question!r}")
+    # Size the context window to just what's needed — smaller num_ctx = faster TTFT
+    total_chars = len(system_prompt) + len(user_msg)
+    estimated_tokens = total_chars // 3  # conservative (Spanish avg ~3 chars/token)
+    # Round up to next multiple of 1024, minimum 4096, maximum 12288
+    raw_ctx = max(4096, min(12288, ((estimated_tokens + 1500) // 1024 + 1) * 1024))
+    print(f"  [Ask] ctx={len(raw_text)+len(kb_text)} chars, tokens≈{estimated_tokens}, num_ctx={raw_ctx}, q={question!r}")
 
     def generate():
         try:
             full = []
-            # Study enumeration questions need more tokens; detect and raise limit
-            study_keywords = ("estudio", "autor", "marco teórico", "investigaci", "trabajo", "referencia", "bibliograf")
+            # Study/comparison/methodology questions need more tokens
+            study_keywords = (
+                "estudio", "autor", "marco teórico", "investigaci", "trabajo",
+                "referencia", "bibliograf", "literatura", "revisión", "revision",
+                "comparan", "compara", "comparar", "comparación", "comparacion",
+                "antecedente", "previo", "resultado", "hallazgo", "aporte",
+                "diferencia", "similar", "coincid", "contrast"
+            )
+            methodology_keywords = (
+                "metodolog", "pdca", "planificar", "ciclo", "mejora",
+                "enfoque", "diseño", "proceso", "etapa", "fase", "validaci"
+            )
             is_study_q = any(w in question.lower() for w in study_keywords)
-            answer_max_tokens = 700 if is_study_q else 400
+            is_method_q = any(w in question.lower() for w in methodology_keywords)
+            answer_max_tokens = 1200 if (is_study_q or is_method_q) else 450
             for token in _stream([{"role": "user", "content": user_msg}],
-                                  max_tokens=answer_max_tokens, system=system_prompt):
+                                  max_tokens=answer_max_tokens, num_ctx=raw_ctx, system=system_prompt):
                 full.append(token)
                 yield f"data: {json.dumps(token)}\n\n"
             print(f"  [Ask/stream] {sum(len(t) for t in full)} chars")
@@ -1141,16 +1349,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="tgl-group">
           <button class="tgl active" id="tgl-ollama"    onclick="setProvider('ollama')">Local (Ollama)</button>
           <button class="tgl"        id="tgl-anthropic" onclick="setProvider('anthropic')">Anthropic API</button>
+          <button class="tgl"        id="tgl-hybrid"    onclick="setProvider('hybrid')" title="Ollama builds the knowledge base (better search), Claude answers (faster). Needs both.">⚡ Hybrid</button>
         </div>
         <div class="tgl-group">
-          <button class="tgl active" id="tgl-whisper" onclick="setTranscribeMode('whisper')">Whisper</button>
-          <button class="tgl"        id="tgl-google"  onclick="setTranscribeMode('google')">Google</button>
+          <button class="tgl active" id="tgl-whisper"   onclick="setTranscribeMode('whisper')">Whisper</button>
+          <button class="tgl"        id="tgl-google"    onclick="setTranscribeMode('google')">Google</button>
+          <button class="tgl"        id="tgl-deepgram"  onclick="setTranscribeMode('deepgram')">⚡ Deepgram</button>
         </div>
         <select id="whisper-model-select" title="Whisper model size (smaller = faster)">
           <option value="small" selected>small (fastest)</option>
           <option value="medium">medium (balanced)</option>
           <option value="large-v3-turbo">large-v3-turbo (best)</option>
         </select>
+        <input id="deepgram-key-input" type="password" placeholder="Deepgram API key…"
+               style="display:none;width:200px;" title="Get a free key at deepgram.com">
         <div class="tgl-group">
           <button class="tgl active" id="tgl-mic"    onclick="setAudioSource('mic')">🎤 Mic</button>
           <button class="tgl"        id="tgl-system" onclick="setAudioSource('system')">🖥️ System</button>
@@ -1158,7 +1370,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <div id="ollama-controls" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <select id="model-select">
-          <option value="gemma4:12b">gemma4:12b (recommended)</option>
+          <option value="gemma4:12b">gemma4:12b (best quality)</option>
+          <option value="gemma3:4b">gemma3:4b (faster ~2s)</option>
+          <option value="qwen2.5:3b">qwen2.5:3b (fastest ~1s)</option>
           <option value="gemma3:12b">gemma3:12b</option>
           <option value="mistral">mistral</option>
           <option value="llama3.1:8b">llama3.1:8b</option>
@@ -1173,6 +1387,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <option value="claude-opus-4-8">claude-opus-4-8 (most capable)</option>
         </select>
         <input id="api-key-input" type="password" placeholder="sk-ant-api…" style="width:220px">
+      </div>
+      <div id="hybrid-controls" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span style="font-size:12px;opacity:.7;">Ollama KB model:</span>
+        <select id="hybrid-ollama-model-select">
+          <option value="gemma4:12b">gemma4:12b (recommended)</option>
+          <option value="gemma3:12b">gemma3:12b</option>
+          <option value="llama3.1:8b">llama3.1:8b</option>
+        </select>
+        <span style="font-size:12px;opacity:.7;">Claude answer model:</span>
+        <select id="hybrid-anthropic-model-select">
+          <option value="claude-haiku-4-5-20251001">claude-haiku-4-5 (fastest)</option>
+          <option value="claude-sonnet-4-6">claude-sonnet-4-6 (best quality)</option>
+        </select>
+        <input id="hybrid-api-key-input" type="password" placeholder="sk-ant-api… (Anthropic key)" style="width:220px">
+        <span style="font-size:11px;opacity:.6;">Ollama builds KB (better search) · Claude answers (faster streaming)</span>
       </div>
     </div>
     <div class="step-indicator ok" id="step1-ind">✓</div>
@@ -1206,6 +1435,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </div>
 
   <button id="start-btn" class="btn btn-green" disabled onclick="toggleListening()">▶&nbsp;&nbsp;Start Listening</button>
+  <button id="answer-now-btn" class="btn" style="display:none;background:var(--blue);color:#fff;" onclick="answerNow()" title="Answer now — works for both direct questions and after a clarification exchange">💬 Answer now</button>
   <hr style="margin-top:16px;">
 
   <div class="status-bar">
@@ -1213,7 +1443,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <span class="status-text" id="status-text">Load a document to begin</span>
     <span id="mode-tag" class="tag" style="display:none"></span>
     <span style="margin-left:auto;" class="vol-bar-wrap">
-      <span style="font-size:11px;color:var(--dim);">mic</span>
+      <span id="vol-label" style="font-size:11px;color:var(--dim);">mic</span>
       <span class="vol-bar-track"><span class="vol-bar-fill" id="vol-bar"></span></span>
     </span>
   </div>
@@ -1236,11 +1466,43 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-let isListening=false, audioContext=null, mediaStream=null, scriptProcessor=null, analyser=null;
+let isListening=false, audioContext=null, mediaStream=null, micStream=null, scriptProcessor=null, analyser=null;
 let transcriptBuffer=[], answering=false;
 let audioSamples=[], chunkTimer=null, speechActive=false, silenceSamples=0;
 let transcribeMode='whisper', currentProvider='ollama', audioSourceMode='mic';
-const SAMPLE_RATE=16000, SILENCE_RMS=0.008, SILENCE_END_S=0.6, MAX_UTTERANCE_S=8;
+let _pendingAnswerTimer=null, _holdMode=false, _pendingCountdownInterval=null;
+// Voice trigger — say any of these words to fire the answer hands-free
+const VOICE_TRIGGERS = ['responde','contesta','contestar','answer','dale','ya'];
+function _checkVoiceTrigger(text){
+  const t = text.toLowerCase().replace(/[^a-záéíóúüñ\s]/g,'').trim();
+  const words = t.split(/\s+/);
+  // Match if the utterance IS (or starts/ends with) a trigger word — avoids false positives
+  // e.g. "responde" → fire; "como responde" → fire; "corresponde" → no (not a word boundary match)
+  return VOICE_TRIGGERS.some(trigger =>
+    words[0] === trigger || words[words.length-1] === trigger ||
+    (words.length <= 3 && words.includes(trigger))
+  );
+}
+const SAMPLE_RATE=16000, SILENCE_RMS=0.002, SILENCE_END_S=0.5, MAX_UTTERANCE_S=5;
+
+// Downsample from any source rate to 16kHz (linear interpolation).
+// This is needed because getDisplayMedia on Windows delivers audio at the
+// system native rate (44100 or 48000 Hz) and Chrome does NOT reliably
+// resample display-capture audio when AudioContext is forced to 16 kHz.
+function resampleTo16k(samples, fromRate) {
+  if (fromRate === SAMPLE_RATE) return samples;
+  const ratio = fromRate / SAMPLE_RATE;
+  const outLen = Math.floor(samples.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const src = i * ratio;
+    const lo  = Math.floor(src);
+    const hi  = Math.min(lo + 1, samples.length - 1);
+    const frac = src - lo;
+    out[i] = samples[lo] * (1 - frac) + samples[hi] * frac;
+  }
+  return out;
+}
 
 document.getElementById('model-select').addEventListener('change', () => {
   document.getElementById('model-custom').style.display =
@@ -1250,34 +1512,60 @@ function setProvider(p) {
   currentProvider = p;
   document.getElementById('tgl-ollama').classList.toggle('active', p==='ollama');
   document.getElementById('tgl-anthropic').classList.toggle('active', p==='anthropic');
+  document.getElementById('tgl-hybrid').classList.toggle('active', p==='hybrid');
   document.getElementById('ollama-controls').style.display    = p==='ollama'    ? 'flex' : 'none';
   document.getElementById('anthropic-controls').style.display = p==='anthropic' ? 'flex' : 'none';
+  document.getElementById('hybrid-controls').style.display    = p==='hybrid'    ? 'flex' : 'none';
 }
 function getModel() {
   if (currentProvider==='anthropic') return document.getElementById('anthropic-model-select').value;
+  if (currentProvider==='hybrid')    return document.getElementById('hybrid-anthropic-model-select').value;
   const v=document.getElementById('model-select').value;
   return v==='custom' ? document.getElementById('model-custom').value.trim() : v;
 }
-function getApiKey() { return document.getElementById('api-key-input').value.trim(); }
+function getApiKey() {
+  if (currentProvider==='hybrid') return document.getElementById('hybrid-api-key-input').value.trim();
+  return document.getElementById('api-key-input').value.trim();
+}
+function getOllamaModel() {
+  if (currentProvider==='hybrid') return document.getElementById('hybrid-ollama-model-select').value;
+  if (currentProvider==='ollama') {
+    const v=document.getElementById('model-select').value;
+    return v==='custom' ? document.getElementById('model-custom').value.trim() : v;
+  }
+  return '';
+}
 function setTranscribeMode(m) {
   transcribeMode = m;
   document.getElementById('tgl-whisper').classList.toggle('active', m === 'whisper');
   document.getElementById('tgl-google').classList.toggle('active', m === 'google');
+  document.getElementById('tgl-deepgram').classList.toggle('active', m === 'deepgram');
+  document.getElementById('whisper-model-select').style.display = m === 'whisper' ? '' : 'none';
+  document.getElementById('deepgram-key-input').style.display  = m === 'deepgram' ? '' : 'none';
   if (isListening) {
     const t = document.getElementById('mode-tag');
-    t.textContent = m === 'whisper' ? 'Whisper' : 'Google Speech';
+    t.textContent = m === 'whisper' ? 'Whisper' : m === 'deepgram' ? '⚡ Deepgram' : 'Google Speech';
   }
 }
 function setAudioSource(m) {
   audioSourceMode = m;
   document.getElementById('tgl-mic').classList.toggle('active', m === 'mic');
   document.getElementById('tgl-system').classList.toggle('active', m === 'system');
+  document.getElementById('vol-label').textContent = m === 'system' ? 'sys' : 'mic';
 }
 
 document.getElementById('file-input').addEventListener('change', async (e) => {
   const file=e.target.files[0]; if(!file) return;
   setStatus('Loading document…','var(--yellow)');
-  const fd=new FormData(); fd.append('file',file); fd.append('model',getModel()); fd.append('provider',currentProvider); fd.append('api_key',getApiKey());
+  const fd=new FormData();
+  fd.append('file',file);
+  fd.append('model',getModel());
+  fd.append('provider',currentProvider);
+  fd.append('api_key',getApiKey());
+  const ollamaModel = getOllamaModel();
+  if (ollamaModel) fd.append('ollama_model', ollamaModel);
+  if (currentProvider==='anthropic') fd.append('anthropic_model', document.getElementById('anthropic-model-select').value);
+  if (currentProvider==='hybrid')    fd.append('anthropic_model', document.getElementById('hybrid-anthropic-model-select').value);
   try {
     const data=await fetch('/load-document',{method:'POST',body:fd}).then(r=>r.json());
     if(data.error){setStatus('Error: '+data.error,'var(--red)');return;}
@@ -1328,35 +1616,304 @@ function updateStartBtn() {
 
 function toggleListening(){isListening?stopListening():startListening();}
 
-async function startListening() {
-  try{
-    if(audioSourceMode==='system'){
-      const disp=await navigator.mediaDevices.getDisplayMedia({
-        audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},
-        video:{width:1,height:1,frameRate:1}
-      });
-      mediaStream=disp;
-      const audioTrack=disp.getAudioTracks()[0];
-      if(!audioTrack){setStatus('No audio track — tick "Share system audio" in the dialog','var(--red)');disp.getTracks().forEach(t=>t.stop());return;}
-      audioTrack.onended=()=>{if(isListening)stopListening();};
-    } else {
-      mediaStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+// ── Deepgram WebSocket streaming ──────────────────────────────────────────────
+let dgSocket=null, dgInterim='', dgFinalBuffer='', dgAnswerTimer=null;
+
+let dgAudioQueue = [];  // buffer audio while WebSocket is still connecting
+
+function dgConnect(apiKey, lang){
+  dgAudioQueue = [];
+  const langCode = lang.split('-')[0];  // 'es-ES' → 'es'
+  // nova-2 is Deepgram's most accurate general model; boost thesis-specific terms
+  const keywords = [
+    'SD-WAN','Starlink','VPN','LTE','VSAT','IPSec','IKEv2','AES','TLS',
+    'SIEM','SASE','Peplink','SpeedFusion','ISO','PHVA','MiPymes',
+    'ciberseguridad','conectividad','arquitectura','resiliencia'
+  ].map(k=>`keywords=${encodeURIComponent(k+':3')}`).join('&');
+  const url = `wss://api.deepgram.com/v1/listen?model=nova-2-general`
+    + `&language=${langCode}&smart_format=true&punctuate=true`
+    + `&interim_results=true&endpointing=300&utterance_end_ms=1000`
+    + `&encoding=linear16&sample_rate=${SAMPLE_RATE}&channels=1&${keywords}`;
+  setStatus('🔌 Connecting to Deepgram…', 'var(--yellow)');
+  dgSocket = new WebSocket(url, ['token', apiKey]);
+  dgSocket.binaryType = 'arraybuffer';
+  dgSocket.onopen = () => {
+    console.log('[Deepgram] connected');
+    setStatus('🎙  Listening…', 'var(--green)');
+    dgInterim = '';
+    // Flush any audio that arrived while we were connecting
+    if (dgAudioQueue.length > 0) {
+      console.log(`[Deepgram] flushing ${dgAudioQueue.length} queued buffers`);
+      for (const buf of dgAudioQueue) dgSocket.send(buf);
+      dgAudioQueue = [];
     }
-  } catch(e){setStatus((audioSourceMode==='system'?'System audio capture':'Microphone')+' denied: '+e.message,'var(--red)');return;}
-  audioContext=new AudioContext({sampleRate:SAMPLE_RATE});
-  const source=audioContext.createMediaStreamSource(mediaStream);
-  analyser=audioContext.createAnalyser(); analyser.fftSize=256; source.connect(analyser);
-  scriptProcessor=audioContext.createScriptProcessor(4096,1,1);
-  source.connect(scriptProcessor); scriptProcessor.connect(audioContext.destination);
+  };
+  dgSocket.onclose = (e) => {
+    console.log('[Deepgram] closed', e.code, e.reason);
+    dgSocket = null;
+    dgAudioQueue = [];
+    const msg = {
+      1000: 'Deepgram session ended normally',
+      1006: 'Deepgram connection lost — check internet',
+      4002: 'Deepgram auth failed — check API key',
+      4003: 'Deepgram quota exceeded',
+    }[e.code] || `Deepgram closed (${e.code})`;
+    setStatus('⚠️ ' + msg, 'var(--red)');
+  };
+  dgSocket.onerror = (e) => {
+    console.error('[Deepgram] error', e);
+    setStatus('Deepgram error — check API key and internet', 'var(--red)');
+  };
+  dgSocket.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      const alt = msg?.channel?.alternatives?.[0];
+      if(!alt) return;
+      const text = (alt.transcript||'').trim();
+      if(!text) return;
+      if(msg.is_final){
+        dgInterim = '';
+        // Accumulate finals — full question may span multiple is_final events
+        if(_checkVoiceTrigger(text)){
+          // Trigger word detected — fire answer, don't add to buffer
+          dgFinalBuffer = '';
+          if(dgAnswerTimer){clearTimeout(dgAnswerTimer);dgAnswerTimer=null;}
+          appendTranscript('▶ ' + text);
+          updateAnswerNowBtn();
+          if(!answering) fireAnswer();
+          return;
+        }
+        dgFinalBuffer = (dgFinalBuffer + ' ' + text).trim();
+        appendTranscript(text);
+        transcriptBuffer.push(text);
+        if(transcriptBuffer.length>12) transcriptBuffer.shift();
+        updateAnswerNowBtn();
+        // Smarter debounce:
+        //   '?' present → 1.2s (question clearly finished)
+        //   ends with tag-word (verdad, cierto, no?) → 1.8s
+        //   otherwise → 3s (still building context before the actual question)
+        const buf = dgFinalBuffer;
+        const hasQ = buf.includes('?');
+        const endsWithTag = /\b(verdad|correcto|cierto|no|eh)\s*[,.]?\s*$/.test(buf.toLowerCase());
+        const debounceMs = hasQ ? 1200 : endsWithTag ? 1800 : 3000;
+        if(dgAnswerTimer) clearTimeout(dgAnswerTimer);
+        dgAnswerTimer = setTimeout(() => {
+          const fullQuestion = dgFinalBuffer;
+          dgFinalBuffer = '';
+          dgAnswerTimer = null;
+          updateAnswerNowBtn();
+          // No auto-answer — user presses "Answer now" when ready (handles clarifications naturally)
+        }, debounceMs);
+      } else {
+        // Show interim result live in status bar
+        dgInterim = text;
+        setStatus('🎙  ' + (dgFinalBuffer ? dgFinalBuffer + ' ' : '') + text.slice(-80), 'var(--green)');
+      }
+    } catch(_){}
+  };
+}
+
+function dgSendAudio(samples){
+  // samples is already resampled to 16kHz Float32Array
+  if(!dgSocket) return;
+  // Convert float32 → int16 PCM (Deepgram expects linear16)
+  const buf = new Int16Array(samples.length);
+  for(let i=0;i<samples.length;i++){
+    const s=Math.max(-1,Math.min(1,samples[i]));
+    buf[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  if(dgSocket.readyState === WebSocket.CONNECTING){
+    // WebSocket not yet open — queue the buffer and flush on open
+    dgAudioQueue.push(buf.buffer.slice(0));  // slice to own the buffer
+    // Don't let the queue grow unbounded (keep last ~3s)
+    if(dgAudioQueue.length > 8) dgAudioQueue.shift();
+  } else if(dgSocket.readyState === WebSocket.OPEN){
+    dgSocket.send(buf.buffer);
+  }
+}
+
+function dgClose(){
+  if(dgAnswerTimer){clearTimeout(dgAnswerTimer);dgAnswerTimer=null;}
+  if(dgSocket){
+    try{ dgSocket.send(JSON.stringify({type:'CloseStream'})); } catch(_){}
+    dgSocket.close(); dgSocket=null;
+  }
+  dgInterim=''; dgFinalBuffer='';
+  updateAnswerNowBtn();
+}
+
+function updateAnswerNowBtn(){
+  const btn = document.getElementById('answer-now-btn');
+  if (!btn) return;
+  btn.style.display = (isListening && transcriptBuffer.length > 0) ? '' : 'none';
+}
+
+function answerNow(){
+  // Manually trigger answer — cancel pending timers and answer immediately
+  if(dgAnswerTimer){clearTimeout(dgAnswerTimer);dgAnswerTimer=null;}
+  resetPendingAnswer();
+  _holdMode = false;
+  dgFinalBuffer = '';
+  updateAnswerNowBtn();
+  fireAnswer();
+}
+
+// Try to find Windows "Stereo Mix" / "What U Hear" loopback device.
+// These appear as audio INPUT devices and work on any driver that supports them,
+// unlike getDisplayMedia system audio which fails on many Windows audio drivers.
+async function _findStereoMix() {
+  try {
+    // Must request mic permission first so labels are revealed
+    await navigator.mediaDevices.getUserMedia({audio:true, video:false}).then(s=>s.getTracks().forEach(t=>t.stop()));
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const loopbackNames = ['stereo mix','what u hear','wave out mix','mixed output','sum','loopback',
+                            'cable output','vb-audio','voicemeeter','virtual audio','blackhole','soundflower'];
+    const found = devices.find(d =>
+      d.kind === 'audioinput' &&
+      loopbackNames.some(n => d.label.toLowerCase().includes(n))
+    );
+    return found || null;
+  } catch(_) { return null; }
+}
+
+let displayStream = null;
+
+async function startListening() {
+  console.log('[Start] mode=' + audioSourceMode + ' transcribe=' + transcribeMode);
+  // AudioContext MUST be created synchronously here, inside the click-handler gesture.
+  // Any await (getDisplayMedia dialog, getUserMedia) expires the gesture — Chrome then
+  // creates AudioContexts in suspended state and onaudioprocess delivers only zeros.
+  audioContext = new AudioContext();
+  console.log('[Start] AudioContext created, state=' + audioContext.state);
+
+  try {
+    if (audioSourceMode === 'system') {
+      // Strategy 1: getDisplayMedia — captures ALL computer audio (WASAPI loopback on the
+      // default render endpoint). Works regardless of output device (speakers or earphones).
+      // User picks "Entire Screen" in the dialog and ticks "Share system audio".
+      console.log('[Audio] Requesting getDisplayMedia for system audio…');
+      const disp = await navigator.mediaDevices.getDisplayMedia({
+        audio: {echoCancellation:false, noiseSuppression:false, autoGainControl:false},
+        video: true,
+        systemAudio: 'include'
+      });
+      displayStream = disp;
+      const audioTrack = disp.getAudioTracks()[0];
+      if (!audioTrack) {
+        setStatus('No audio track — tick "Share system audio" in the Chrome dialog', 'var(--red)');
+        disp.getTracks().forEach(t => t.stop());
+        audioContext.close(); audioContext = null;
+        return;
+      }
+      // Do NOT check audioTrack.muted here — Chrome reports system audio tracks as
+      // temporarily muted during initialization on Windows; the track unmutes once
+      // the WASAPI loopback opens. Checking muted here causes a false early exit.
+      console.log('[Audio] getDisplayMedia OK, audioTrack:', audioTrack.label, 'muted:', audioTrack.muted, 'readyState:', audioTrack.readyState);
+      mediaStream = new MediaStream([audioTrack]);
+      audioTrack.onmute   = () => console.warn('[Audio] system track muted');
+      audioTrack.onunmute = () => console.log('[Audio] system track unmuted');
+      audioTrack.onended  = () => { if (isListening) stopListening(); };
+
+      // Also capture mic so the user's own voice (clarifications) is transcribed too.
+      // This is a best-effort add-on — failure here does NOT abort the session.
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false
+        });
+        console.log('[Audio] Mic also captured — both voices will be transcribed');
+      } catch(_) {
+        micStream = null;
+        console.warn('[Audio] Mic capture failed — system audio only (your voice won\'t be transcribed)');
+      }
+    } else {
+      mediaStream = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
+    }
+  } catch(e) {
+    console.error('[Start] capture failed:', e);
+    setStatus((audioSourceMode==='system' ? 'System audio capture' : 'Microphone') + ' failed: ' + e.message, 'var(--red)');
+    if(audioContext){ audioContext.close(); audioContext = null; }
+    return;
+  }
+
+  // Connect Deepgram WebSocket if in deepgram mode
+  if (transcribeMode === 'deepgram') {
+    const dgKey = document.getElementById('deepgram-key-input').value.trim();
+    if (!dgKey) {
+      setStatus('Enter your Deepgram API key first', 'var(--red)');
+      mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null;
+      if (displayStream) { displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; }
+      audioContext.close(); audioContext = null;
+      return;
+    }
+    const lang = document.getElementById('lang-select').value;
+    dgConnect(dgKey, lang);
+  }
+
+  const nativeRate = audioContext.sampleRate;
+  console.log(`[Audio] ctx=${nativeRate}Hz`);
+  const captureLabel = audioSourceMode === 'system'
+    ? (micStream ? 'System + Mic' : 'System audio')
+    : 'Mic';
+  setStatus(`🎙  Listening… (${captureLabel})`, 'var(--green)');
+
+  const source = audioContext.createMediaStreamSource(mediaStream);
+  analyser = audioContext.createAnalyser(); analyser.fftSize = 256; source.connect(analyser);
+
+  const bufSize = Math.pow(2, Math.round(Math.log2(nativeRate * 0.256)));
+  scriptProcessor = audioContext.createScriptProcessor(bufSize, 1, 1);
+  source.connect(scriptProcessor);
+
+  // In system mode, also mix in mic so both voices get transcribed
+  if (micStream) {
+    const micSource = audioContext.createMediaStreamSource(micStream);
+    micSource.connect(scriptProcessor);
+  }
+
+  // Mute system audio to prevent feedback; ScriptProcessor must reach destination
+  // or onaudioprocess won't fire.
+  const silentOut = audioContext.createGain();
+  silentOut.gain.value = audioSourceMode === 'system' ? 0 : 1;
+  scriptProcessor.connect(silentOut);
+  silentOut.connect(audioContext.destination);
+
+  let _rmsLogCounter = 0;
   scriptProcessor.onaudioprocess=(e)=>{
-    const data=e.inputBuffer.getChannelData(0),samples=Array.from(data);
+    const raw = e.inputBuffer.getChannelData(0);
+    // Resample from native rate down to 16kHz
+    const samples = resampleTo16k(raw, nativeRate);
     const rms=Math.sqrt(samples.reduce((s,x)=>s+x*x,0)/samples.length);
-    if(rms>SILENCE_RMS){speechActive=true;silenceSamples=0;audioSamples.push(...samples);}
-    else if(speechActive){
-      silenceSamples+=samples.length; audioSamples.push(...samples);
-      if(silenceSamples/SAMPLE_RATE>=SILENCE_END_S){
-        speechActive=false; silenceSamples=0;
-        if(chunkTimer){clearTimeout(chunkTimer);chunkTimer=null;} sendChunk();
+    // Log first callback so user can check console for raw values
+    if(_rmsLogCounter === 0){
+      console.log(`[Audio] first callback: bufLen=${raw.length} rms=${rms.toFixed(5)} max=${Math.max(...raw.slice(0,16).map(Math.abs)).toFixed(5)} nCh=${e.inputBuffer.numberOfChannels}`);
+    }
+    if(++_rmsLogCounter % 20 === 0){
+      console.log(`[Audio] rms=${rms.toFixed(5)}`);
+      const bar = rms > 0.001 ? '▓'.repeat(Math.min(10,Math.round(rms*200))) : '';
+      if(rms > 0.001){
+        setStatus(`🎙  Listening… ${bar}`, 'var(--green)');
+      } else if(_rmsLogCounter > 16 && audioSourceMode === 'system'){
+        const trk = mediaStream && mediaStream.getAudioTracks()[0];
+        const trkState = trk ? `track=${trk.readyState} muted=${trk.muted}` : 'no track';
+        console.warn('[Audio] silence detected:', trkState);
+        setStatus('⚠️ No audio — make sure you picked "Entire Screen" (not a window) and ticked "Also share system audio" in the Chrome dialog', 'var(--yellow)');
+      }
+    }
+    if(transcribeMode==='deepgram'){
+      dgSendAudio(samples);
+      return;
+    }
+    // Always accumulate all samples (system audio bypasses VAD; mic uses it for early cuts)
+    audioSamples.push(...samples);
+    if(audioSourceMode!=='system'){
+      // Mic: trigger early send on silence after speech
+      if(rms>SILENCE_RMS){speechActive=true;silenceSamples=0;}
+      else if(speechActive){
+        silenceSamples+=samples.length;
+        if(silenceSamples/SAMPLE_RATE>=SILENCE_END_S){
+          speechActive=false; silenceSamples=0;
+          if(chunkTimer){clearTimeout(chunkTimer);chunkTimer=null;} sendChunk();
+        }
       }
     }
   };
@@ -1364,7 +1921,7 @@ async function startListening() {
   const btn=document.getElementById('start-btn');
   btn.className='btn btn-red'; btn.textContent='⏹  Stop Listening'; btn.disabled=false;
   const tag=document.getElementById('mode-tag');
-  tag.textContent=transcribeMode==='whisper' ? 'Whisper' : 'Google Speech'; tag.style.display='';
+  tag.textContent=transcribeMode==='whisper' ? 'Whisper' : transcribeMode==='deepgram' ? '⚡ Deepgram' : 'Google Speech'; tag.style.display='';
   setStatus('🎙  Listening…','var(--green)'); updateVolume();
   function resetCap(){
     if(chunkTimer)clearTimeout(chunkTimer);
@@ -1375,14 +1932,19 @@ async function startListening() {
 
 function stopListening(){
   isListening=false; clearTimeout(chunkTimer); chunkTimer=null;
+  resetPendingAnswer(); _holdMode=false;
+  dgClose();
   if(scriptProcessor){scriptProcessor.disconnect();scriptProcessor=null;}
   if(analyser){analyser.disconnect();analyser=null;}
   if(audioContext){audioContext.close();audioContext=null;}
   if(mediaStream){mediaStream.getTracks().forEach(t=>t.stop());mediaStream=null;}
+  if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}
+  if(displayStream){displayStream.getTracks().forEach(t=>t.stop());displayStream=null;}
   audioSamples=[]; document.getElementById('vol-bar').style.width='0%';
   document.getElementById('mode-tag').style.display='none';
   document.getElementById('start-btn').className='btn btn-green';
   document.getElementById('start-btn').textContent='▶  Start Listening';
+  document.getElementById('answer-now-btn').style.display='none';
   setStatus('Stopped','var(--dim)');
 }
 
@@ -1396,7 +1958,7 @@ function updateVolume(){
 async function sendChunk(){
   if(!isListening||audioSamples.length===0)return;
   const samples=audioSamples.splice(0,audioSamples.length);
-  const wav = encodeWav(samples, audioContext.sampleRate);
+  const wav = encodeWav(samples, SAMPLE_RATE);
   const lang = document.getElementById('lang-select').value;
   try{
     const wmodel=document.getElementById('whisper-model-select').value;
@@ -1404,9 +1966,16 @@ async function sendChunk(){
       {method:'POST',headers:{'Content-Type':'audio/wav'},body:wav}).then(r=>r.json());
     if(data.error){setStatus('Transcription error: '+data.error,'var(--yellow)');return;}
     const text=(data.text||'').trim(); if(!text)return;
-    appendTranscript(text); transcriptBuffer.push(text);
-    if(transcriptBuffer.length>12)transcriptBuffer.shift();
-    if(isQuestion(text)&&!answering)answerQuestion(text);
+    if(_checkVoiceTrigger(text)){
+      // User said the trigger word — fire answer without adding the trigger to the buffer
+      appendTranscript('▶ ' + text);
+      updateAnswerNowBtn();
+      if(!answering) fireAnswer();
+    } else {
+      appendTranscript(text); transcriptBuffer.push(text);
+      if(transcriptBuffer.length>12)transcriptBuffer.shift();
+      updateAnswerNowBtn();
+    }
   }catch(e){console.warn('Transcribe:',e.message);}
 }
 
@@ -1419,6 +1988,17 @@ function encodeWav(samples,sr){
   ws(36,'data');v.setUint32(40,samples.length*2,true);
   for(let i=0;i<samples.length;i++){const s=Math.max(-1,Math.min(1,samples[i]));v.setInt16(44+i*2,s<0?s*0x8000:s*0x7FFF,true);}
   return buf;
+}
+
+function resetPendingAnswer() {
+  if(_pendingAnswerTimer){ clearTimeout(_pendingAnswerTimer); _pendingAnswerTimer = null; }
+  if(_pendingCountdownInterval){ clearInterval(_pendingCountdownInterval); _pendingCountdownInterval = null; }
+}
+
+function fireAnswer() {
+  // Send the last 5 transcript chunks — captures a full clarification exchange if one happened
+  const recentTurns = transcriptBuffer.slice(-5).join(' ').trim();
+  if(recentTurns && !answering) answerQuestion(recentTurns);
 }
 
 function isQuestion(text){
@@ -1524,4 +2104,6 @@ if __name__ == "__main__":
     print(f"  Default model: {DEFAULT_MODEL}")
     print(f"  Press Ctrl+C to stop\n")
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    if _WHISPER_AVAILABLE:
+        threading.Thread(target=_preload_whisper, daemon=True).start()
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
